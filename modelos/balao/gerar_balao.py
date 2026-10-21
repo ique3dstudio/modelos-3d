@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Gera os STLs do balão giratório (brinquedo sensorial).
+"""Balão sensorial de gomos deslizantes (print-in-place) + suporte com aro.
 
-Peças: envelope em duas metades (com mancal interno), cesta com colar, pino e base.
-O envelope fica pendurado na ponta arredondada do pino e gira livremente.
+O balão tem 16 gomos. Cada par de gomos vizinhos é ligado por uma junta de pino e olhal
+que permite um deslize vertical de +-8 mm. Ao puxar um gomo para cima os outros ficam
+pendurados em escada, como as folhas da foto de referência. Nenhum gomo se solta.
+O gomo 15 e o gomo 0 não têm junta entre si (a corrente é aberta).
 
-Uso:  python3 gerar_balao.py [--diametro 120] [--parede 1.6] [--saida ../../stl/balao]
+Uso:  python3 gerar_balao.py [--diametro 120] [--saida ../../stl/balao]
 
-Dependências: numpy, scipy, trimesh, manifold3d, networkx
-Unidades: milímetros.
+Dependências: numpy, scipy, trimesh, manifold3d, networkx.  Unidades: mm.
 """
 import argparse
 import os
@@ -16,87 +17,127 @@ import numpy as np
 import trimesh
 from scipy.interpolate import PchipInterpolator
 
-# Perfil do envelope: (z/H, r/H), de baixo (boca) para cima (topo), medido na foto.
-# O diâmetro máximo é 0,8 H.
+# ----------------------------------------------------------------- parâmetros
+N_GOMOS = 16
+PAREDE = 2.0            # espessura da casca
+GAP = 0.25              # folga de cada lado entre gomos (0,5 mm no total)
+R_TOPO = 5.0            # raio da abertura no topo (os gomos terminam aqui)
+RELEVO_MAX = 1.4        # maior altura de textura acima da superfície base
+N_Z, N_T = 200, 30      # resolução da malha: linhas no perfil / colunas por gomo
+LOSANGOS_ALTURA = 7     # losangos da boca ao topo
+V0 = 0.5
+
+# perfil (z/H, r/H): boca embaixo, topo em cima; diâmetro máximo = 0,8 H
 PERFIL = [
     (0.00, 0.100), (0.06, 0.120), (0.15, 0.180), (0.30, 0.300), (0.45, 0.385),
     (0.60, 0.400), (0.80, 0.3464), (0.906, 0.257), (0.9759, 0.1368),
     (0.9984, 0.0349), (1.00, 0.000),
 ]
-N_LOSANGOS_VOLTA = 16   # losangos ao redor do balão
-N_LOSANGOS_ALTURA = 6   # losangos da boca ao topo
-RELEVO = 1.2            # mm de relevo dos losangos (para pintar)
-N_Z, N_T = 180, 96      # resolução: pontos no perfil / segmentos por metade
 
-# Mecanismo giratório
-POSTE_R = 10.0          # raio do mancal (poste que desce do topo do envelope)
-POSTE_Z = 0.74          # altura (z/H) da face de baixo do mancal
-PINO_R = 5.0            # raio do pino
-FOLGA = 0.25            # folga de encaixe (mm)
-ALTURA_BOCA = 57.0      # altura da boca do envelope acima do topo da base
-ENCAIXE_PINO = 16.0     # profundidade do pino dentro da base
-BASE_D, BASE_H = 120.0, 12.0
+# junta pino + olhal
+PINO_R, CABECA_R, CABECA_H = 2.2, 3.6, 1.5
+OLHAL_FURO, OLHAL_R, OLHAL_H = 2.6, 4.6, 8.0
+LIVRE = 24.0            # comprimento livre do pino entre as cabeças (curso = LIVRE - OLHAL_H)
+PINO_Y = -4.4           # posição tangencial do pino (dentro do gomo k)
+R_PINO = 44.0
 
 
-def perfil_denso(H, n):
-    z, r = np.array(PERFIL).T
-    # o diâmetro máximo (2*0,4*H) já inclui o relevo dos losangos
-    f = PchipInterpolator(z * H, r * H * (0.4 * H - RELEVO) / (0.4 * H))
-    zz = np.linspace(0, H, n)
-    return zz, np.clip(f(zz), 0, None)
+def sm(x):
+    x = np.clip(x, 0, 1)
+    return x * x * (3 - 2 * x)
 
 
-def deslocamento(theta, arco, comp_arco, relevo):
-    """Relevo em losangos: 1 dentro do losango, 0 fora, com borda suave."""
-    u = theta / (2 * np.pi) * N_LOSANGOS_VOLTA
-    v = arco / comp_arco * N_LOSANGOS_ALTURA
-    dd = np.abs((u % 1) - 0.5) + np.abs((v % 1) - 0.5)
-    t = np.clip((0.42 - dd) / 0.06, 0, 1)
-    return relevo * t * t * (3 - 2 * t)
+# --------------------------------------------------------------------- perfil
+class Perfil:
+    def __init__(self, H):
+        self.H = H
+        z, r = np.array(PERFIL).T
+        esc = (0.4 * H - RELEVO_MAX) / (0.4 * H)      # diâmetro final inclui o relevo
+        f = PchipInterpolator(z * H, r * H * esc)
+        zz = np.linspace(0, H, 6000)
+        rr = np.clip(f(zz), 0, None)
+        ok = rr >= R_TOPO
+        zz, rr = zz[ok], rr[ok]
+        s = np.concatenate([[0], np.cumsum(np.hypot(np.diff(zz), np.diff(rr)))])
+        self.comp = s[-1]
+        sg = np.linspace(0, s[-1], N_Z)
+        self.s = sg
+        self.z = np.interp(sg, s, zz)
+        self.r = np.interp(sg, s, rr)
+        tr, tz = np.gradient(self.r, sg), np.gradient(self.z, sg)
+        self.nr, self.nz = tz, -tr                    # normal externa (unitária)
+        self.zi = self.z - PAREDE * self.nz
+        self.ri = np.clip(self.r - PAREDE * self.nr, 0.5, None)
+
+    def r_interno(self, z):
+        return float(np.interp(z, self.zi, self.ri))
 
 
-def metade_envelope(H, parede, theta0):
-    z, r = perfil_denso(H, N_Z)
-    dz, dr = np.gradient(z), np.gradient(r)
-    norm = np.hypot(dz, dr)
-    nz, nr = -dr / norm, dz / norm            # normal externa (no plano r-z)
-    # arco acumulado, para losangos de proporção parecida em qualquer altura
-    arco = np.concatenate([[0], np.cumsum(np.hypot(np.diff(z), np.diff(r)))])
-    zi = z - parede * nz
-    ri = np.clip(r - parede * nr, 0, None)
-    ri[-1] = 0
-    zi[-1] = z[-1] - parede
+# ------------------------------------------------------------------- texturas
+def textura(theta, arco, comp):
+    """Altura (mm) da textura em cada ponto. Losangos escalonados como no logo."""
+    u = theta / (2 * np.pi) * N_GOMOS
+    v = arco / comp * LOSANGOS_ALTURA + V0
+    p, q = u + v, u - v
+    a, b = np.round(p / 2), np.round(q / 2)
+    dp, dq = p - 2 * a, q - 2 * b
+    dd = np.maximum(np.abs(dp), np.abs(dq))
+    tipo = np.mod(np.floor((a + b) / 2) + (a - b), 4)
 
-    th = np.linspace(theta0, theta0 + np.pi, N_T + 1)
-    T, A = np.meshgrid(th, arco)               # (N_Z, N_T+1)
-    d = deslocamento(T, A, arco[-1], RELEVO)
-    d[-8:] *= np.linspace(1, 0, 8)[:, None]    # relevo some perto do topo
-    d[:3] *= np.linspace(0, 1, 3)[:, None]     # e na boca (borda lisa)
-    Ro = r[:, None] + d * nr[:, None]
-    Zo = z[:, None] + d * nz[:, None] + 0 * T
-    Ri = np.broadcast_to(ri[:, None], T.shape)
-    Zi = np.broadcast_to(zi[:, None], T.shape)
+    moldura = 0.6 * sm((0.95 - dd) / 0.07)
+    t0 = np.full_like(dd, 1.4)                                        # liso, alto
+    t1 = 0.4 + 1.0 * np.clip(np.cos(2 * np.pi * 2.5 * dp) * np.cos(2 * np.pi * 2.5 * dq) * 1.6, 0, 1)
+    t2 = 0.5 + 0.9 * (0.5 + 0.5 * np.cos(2 * np.pi * 3.0 * dp))      # listras
+    t3 = np.full_like(dd, -0.6)                                       # afundado
+    interno = np.select([tipo == 0, tipo == 1, tipo == 2], [t0, t1, t2], t3)
+    m = sm((0.50 - dd) / 0.04)
+    return moldura * (1 - m) + interno * m
 
-    def xyz(R, Z):
+
+# ---------------------------------------------------------------------- gomos
+def casca_gomo(P, k):
+    th0, th1 = k * 2 * np.pi / N_GOMOS, (k + 1) * 2 * np.pi / N_GOMOS
+    s_o = th0 + np.arcsin(GAP / P.r)
+    e_o = th1 - np.arcsin(GAP / P.r)
+    s_i = th0 + np.arcsin(GAP / P.ri)
+    e_i = th1 - np.arcsin(GAP / P.ri)
+    f = np.linspace(0, 1, N_T + 1)[None, :]
+    To = s_o[:, None] + (e_o - s_o)[:, None] * f
+    Ti = s_i[:, None] + (e_i - s_i)[:, None] * f
+    A = np.broadcast_to(P.s[:, None], To.shape)
+
+    d = textura(To, A, P.comp)
+    rampa = np.ones(N_Z)
+    n = 8
+    rampa[:n] = np.linspace(0, 1, n)
+    rampa[-n:] = np.linspace(1, 0, n)
+    d = d * rampa[:, None]
+    Ro = P.r[:, None] + d * P.nr[:, None]
+    Zo = P.z[:, None] + d * P.nz[:, None]
+    Ri = np.broadcast_to(P.ri[:, None], Ti.shape)
+    Zi = np.broadcast_to(P.zi[:, None], Ti.shape)
+
+    def xyz(R, Z, T):
         return np.stack([R * np.cos(T), R * np.sin(T), Z], -1).reshape(-1, 3)
 
     nv = N_Z * (N_T + 1)
-    V = np.vstack([xyz(Ro, Zo), xyz(Ri, Zi)])
+    V = np.vstack([xyz(Ro, Zo, To), xyz(Ri, Zi, Ti)])
     idx = lambda off, j, i: off + j * (N_T + 1) + i
     F = []
     for j in range(N_Z - 1):
         for i in range(N_T):
             a, b = idx(0, j, i), idx(0, j, i + 1)
             c, e = idx(0, j + 1, i + 1), idx(0, j + 1, i)
-            F += [(a, b, c), (a, c, e)]                       # casca externa
+            F += [(a, b, c), (a, c, e)]
             a, b = idx(nv, j, i), idx(nv, j, i + 1)
             c, e = idx(nv, j + 1, i + 1), idx(nv, j + 1, i)
-            F += [(a, c, b), (a, e, c)]                       # casca interna
-    for i in range(N_T):                                      # aro da boca
-        a, b = idx(0, 0, i), idx(0, 0, i + 1)
-        c, e = idx(nv, 0, i + 1), idx(nv, 0, i)
-        F += [(a, c, b), (a, e, c)]
-    for i in (0, N_T):                                        # faces de corte
+            F += [(a, c, b), (a, e, c)]
+    for i in range(N_T):
+        for j, inv in ((0, False), (N_Z - 1, True)):          # aros da boca e do topo
+            a, b = idx(0, j, i), idx(0, j, i + 1)
+            c, e = idx(nv, j, i + 1), idx(nv, j, i)
+            F += [(a, b, c), (a, c, e)] if inv else [(a, c, b), (a, e, c)]
+    for i in (0, N_T):                                         # faces laterais
         for j in range(N_Z - 1):
             a, b = idx(0, j, i), idx(0, j + 1, i)
             c, e = idx(nv, j + 1, i), idx(nv, j, i)
@@ -108,129 +149,150 @@ def metade_envelope(H, parede, theta0):
     return m
 
 
-def mancal(H, parede, theta0):
-    """Poste cheio que desce do topo; tem uma covinha cônica onde a ponta do pino apoia."""
-    z_base = POSTE_Z * H
-    z_topo = H - 1.0                           # termina dentro da parede do topo
-    poste = trimesh.creation.cylinder(radius=POSTE_R, height=z_topo - z_base, sections=64)
-    poste.apply_translation([0, 0, (z_topo + z_base) / 2])
-    cone = trimesh.creation.cone(radius=6.5, height=6.5, sections=48)   # ápice para cima
-    cone.apply_translation([0, 0, z_base - 0.01])
-    poste = trimesh.boolean.difference([poste, cone], engine="manifold")
-    lado = 1 if theta0 == 0 else -1            # metade y>=0 ou y<=0
-    caixa = trimesh.creation.box(extents=[4 * POSTE_R, 2 * POSTE_R, H])
-    caixa.apply_translation([0, lado * POSTE_R, H / 2])
-    return trimesh.boolean.intersection([poste, caixa], engine="manifold")
+def hull(*ms):
+    return trimesh.convex.convex_hull(np.vstack([m.vertices for m in ms]))
 
 
-def deitar_na_mesa(m, lado):
-    """Gira a metade para a face de corte ficar na mesa (sem suportes)."""
-    s = 1 if lado == 0 else -1
-    R = trimesh.transformations.rotation_matrix(s * np.pi / 2, [1, 0, 0])
-    m.apply_transform(R)
-    m.apply_translation(-m.bounds[0] * [0, 0, 1] - [m.centroid[0], m.centroid[1], 0])
+def cil(r, h, x=0, y=0, z=0, sec=32):
+    c = trimesh.creation.cylinder(radius=r, height=h, sections=sec)
+    c.apply_translation([x, y, z])
+    return c
+
+
+def caixa(sx, sy, sz, x, y, z):
+    b = trimesh.creation.box(extents=[sx, sy, sz])
+    b.apply_translation([x, y, z])
+    return b
+
+
+def junta(P, zc):
+    """Peças da junta entre o gomo k (pino) e o gomo k+1 (olhal), no quadro da emenda:
+    x = radial, y = tangencial (+ para o gomo k+1), emenda em y = 0."""
+    za, zb = zc - LIVRE / 2, zc + LIVRE / 2
+
+    def haste(z_ref, sentido):
+        """Escora a 45 graus da cabeça até a parede do gomo k."""
+        z = z_ref
+        for _ in range(30):
+            xw = P.r_interno(z)
+            z = z_ref + sentido * (xw - R_PINO)
+        xw = P.r_interno(z)
+        pad = caixa(1.6, 6.0, 5.0, xw - 0.2, PINO_Y, z)
+        return hull(cabeca_ref[z_ref], pad), pad
+
+    cabeca_ref = {}
+    cab_b = cil(CABECA_R, CABECA_H, R_PINO, PINO_Y, za - CABECA_H / 2)
+    cab_t = cil(CABECA_R, CABECA_H, R_PINO, PINO_Y, zb + CABECA_H / 2)
+    cabeca_ref[za - CABECA_H] = cab_b
+    cabeca_ref[zb + CABECA_H] = cab_t
+    esc_b, _ = haste(za - CABECA_H, -1)
+    esc_t, _ = haste(zb + CABECA_H, +1)
+    pino = cil(PINO_R, LIVRE + CABECA_H, R_PINO, PINO_Y, zc)   # termina dentro das cabeças
+    partes_k = [pino, esc_b, esc_t]                           # as escoras já incluem as cabeças
+
+    xw = P.r_interno(zc)
+    anel = cil(OLHAL_R, OLHAL_H, R_PINO, PINO_Y, zc)
+    pad = caixa(1.6, 6.0, OLHAL_H, xw - 0.2, 4.0, zc)
+    olhal = hull(anel, pad)
+    furo = cil(OLHAL_FURO, 30, R_PINO, PINO_Y, zc)
+    olhal = trimesh.boolean.difference([olhal, furo], engine="manifold")
+    return partes_k, olhal
+
+
+def girar(m, ang):
+    m = m.copy()
+    m.apply_transform(trimesh.transformations.rotation_matrix(ang, [0, 0, 1]))
     return m
 
 
-def boca_raio(H):
-    return perfil_denso(H, 2)[1][0]
+def montar_gomos(H):
+    P = Perfil(H)
+    zc = 0.6 * H
+    pk, olhal = junta(P, zc)
+    gomos = []
+    for k in range(N_GOMOS):
+        partes = [casca_gomo(P, k)]
+        if k < N_GOMOS - 1:                                    # pino: emenda com o gomo k+1
+            partes += [girar(m, (k + 1) * 2 * np.pi / N_GOMOS) for m in pk]
+        if k > 0:                                              # olhal: emenda com o gomo k-1
+            partes.append(girar(olhal, k * 2 * np.pi / N_GOMOS))
+        g = trimesh.boolean.union(partes, engine="manifold") if len(partes) > 1 else partes[0]
+        gomos.append(g)
+        print(f"gomo {k:2d}: watertight={g.is_watertight} faces={len(g.faces)}", flush=True)
+    return gomos, P
 
 
-def boca_raio_interno(H, parede):
-    return boca_raio(H) - parede
+# -------------------------------------------------------------------- suporte
+def suporte(P):
+    """Base larga + cesta trançada + 4 hastes + aro com assento cônico para o balão."""
+    base_r, base_h = 65.0, 8.0
+    rb = 4.0
+    pts = [(0, 0), (base_r - rb, 0)]
+    for a in np.linspace(-np.pi / 2, 0, 8):
+        pts.append((base_r - rb + rb * np.cos(a), rb + rb * np.sin(a)))
+    pts += [(base_r, base_h - 1), (base_r - 1, base_h), (0, base_h)]
+    base = trimesh.creation.revolve(np.array(pts), sections=128)
 
-
-def cesta_com_colar(H, parede):
-    """Cesta (anel trançado) + 4 hastes grossas + flange + colar que entra na boca."""
-    k = H / 150
-    rb, rt, alt = 15.0, 17.0, 15.0
-    furo = 12.5
-    pts = [(furo, 0), (rb, 0)]
-    n = 8                                         # fileiras de trama
+    alt, rb_c, rt_c = 15.0, 15.0, 17.0
+    pts = [(0, base_h - 0.5), (rb_c, base_h - 0.5)]
+    n = 8
     for s in range(n):
         z0, z1 = alt * s / n, alt * (s + 1) / n
-        r0 = rb + (rt - rb) * s / n
-        r1 = rb + (rt - rb) * (s + 1) / n
-        pts += [(r0 + 0.6, z0 + (z1 - z0) * 0.25), (r1 + 0.6, z0 + (z1 - z0) * 0.7), (r1, z1)]
-    pts += [(furo, alt), (furo, 0)]
+        r0, r1 = rb_c + (rt_c - rb_c) * s / n, rb_c + (rt_c - rb_c) * (s + 1) / n
+        pts += [(r0 + 0.6, base_h + z0 + (z1 - z0) * 0.25), (r1 + 0.6, base_h + z0 + (z1 - z0) * 0.7),
+                (r1, base_h + z1)]
+    pts += [(0, base_h + alt)]
     cesta = trimesh.creation.revolve(np.array(pts), sections=96)
 
-    folga_hastes = 35.0                           # comprimento livre das hastes
-    z_flange = alt + folga_hastes
-    r_col = boca_raio_interno(H, parede) - 0.6    # entra na boca com folga p/ cola
-    partes = [cesta]
+    z_cesta = base_h + alt
+    z_aro = z_cesta + 70.0
+    r_boca = P.r[0]
+    r_aro = 26.0
+    # aro: face de cima plana, de baixo em 45 graus para imprimir sem suporte
+    pts_aro = [(0, z_aro + 5), (r_aro, z_aro + 5), (r_aro, z_aro + 3), (r_aro - 5, z_aro - 2),
+               (0, z_aro - 2)]
+    aro = trimesh.creation.revolve(np.array(pts_aro), sections=96)
+    # assento cônico dentro da boca do balão (folga de 0,8 mm)
+    ri_boca = P.ri[0]
+    pts_c = [(0, z_aro + 5), (ri_boca - 0.8 - 0.0, z_aro + 5), (ri_boca - 0.8 + 3.0, z_aro + 15),
+             (0, z_aro + 15)]
+    cone = trimesh.creation.revolve(np.array(pts_c), sections=96)
+
+    hastes = []
     for a in np.deg2rad([45, 135, 225, 315]):
-        h = trimesh.creation.cylinder(radius=1.6, height=folga_hastes + 4, sections=24)
-        h.apply_translation([14.5 * np.cos(a), 14.5 * np.sin(a), alt - 2 + (folga_hastes + 4) / 2])
-        partes.append(h)
-    flange = trimesh.creation.annulus(r_min=9.2, r_max=boca_raio(H) + 1.5, height=2.0, sections=96)
-    flange.apply_translation([0, 0, z_flange + 1.0])
-    colar = trimesh.creation.annulus(r_min=9.2, r_max=r_col, height=10.0, sections=96)
-    colar.apply_translation([0, 0, z_flange + 2.0 + 5.0])
-    partes += [flange, colar]
-    m = trimesh.boolean.union(partes, engine="manifold")
-    return m, z_flange + 2.0                      # z da face de apoio na boca
+        p0 = np.array([12.0 * np.cos(a), 12.0 * np.sin(a), z_cesta - 1.0])
+        p1 = np.array([(r_aro - 5.5) * np.cos(a), (r_aro - 5.5) * np.sin(a), z_aro])
+        v = p1 - p0
+        L = np.linalg.norm(v)
+        h = trimesh.creation.cylinder(radius=2.6, height=L + 3, sections=24)
+        zax = v / L
+        T = trimesh.geometry.align_vectors([0, 0, 1], zax)
+        h.apply_transform(T)
+        h.apply_translation((p0 + p1) / 2)
+        hastes.append(h)
+    pecas = [base, cesta, aro, cone] + hastes
+    for m in pecas:
+        if m.volume < 0:
+            m.invert()
+    s = trimesh.boolean.union(pecas, engine="manifold")
+    return s, z_aro + 5
 
 
-def pino(H, z_ponta_acima_base):
-    """Pino com ponta arredondada, deitado para impressão."""
-    comp = z_ponta_acima_base - 1.0          # o pino apoia no fundo do furo, 1 mm acima da base
-    r_ponta = 2.5
-    haste = comp - 5.0 - r_ponta
-    pts = [(0, 0), (PINO_R, 0), (PINO_R, haste), (r_ponta, haste + 5.0)]
-    for ang in np.linspace(0, np.pi / 2, 12):
-        pts.append((r_ponta * np.cos(ang), haste + 5.0 + r_ponta * np.sin(ang)))
-    m = trimesh.creation.revolve(np.array(pts), sections=64)
-    m.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [0, 1, 0]))
-    m.apply_translation([-m.bounds[0][0], 0, PINO_R])
-    return m, comp
-
-
-def base():
-    """Disco largo e baixo com bordas arredondadas e colar para o pino."""
-    r, h = BASE_D / 2, BASE_H
-    rb = 5.0                                      # raio da borda arredondada
-    pts = [(0, 0), (r - rb, 0)]
-    for ang in np.linspace(-np.pi / 2, 0, 10):
-        pts.append((r - rb + rb * np.cos(ang), rb + rb * np.sin(ang)))
-    for ang in np.linspace(0, np.pi / 2, 10):
-        pts.append((r - rb + rb * np.cos(ang), h - rb + rb * np.sin(ang)))
-    pts += [(14.0, h), (11.0, h + 3.0), (11.0, h + ENCAIXE_PINO + 2.0), (0, h + ENCAIXE_PINO + 2.0)]
-    m = trimesh.creation.revolve(np.array(pts), sections=128)
-    furo = trimesh.creation.cylinder(radius=PINO_R + FOLGA, height=ENCAIXE_PINO + 1.0, sections=64)
-    furo.apply_translation([0, 0, h + ENCAIXE_PINO + 2.0 - (ENCAIXE_PINO + 1.0) / 2 + 0.01])
-    return trimesh.boolean.difference([m, furo], engine="manifold")
-
-
+# ----------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--diametro", type=float, default=120.0, help="diâmetro máximo do envelope (mm)")
-    ap.add_argument("--parede", type=float, default=1.6, help="espessura da parede (mm)")
+    ap.add_argument("--diametro", type=float, default=120.0, help="diâmetro máximo do balão (mm)")
     ap.add_argument("--saida", default=os.path.join(os.path.dirname(__file__), "..", "..", "stl", "balao"))
     a = ap.parse_args()
     os.makedirs(a.saida, exist_ok=True)
     H = a.diametro / 0.8
-    pecas = {}
-    for nome, lado in (("envelope_metade_A", 0), ("envelope_metade_B", 1)):
-        theta0 = np.pi * lado
-        casca = metade_envelope(H, a.parede, theta0)
-        m = trimesh.boolean.union([casca, mancal(H, a.parede, theta0)], engine="manifold")
-        pecas[nome] = deitar_na_mesa(m, lado)
-
-    cesta, z_apoio = cesta_com_colar(H, a.parede)
-    pecas["cesta_com_colar"] = cesta
-    # altura da ponta do pino acima do topo da base
-    z_ponta = ALTURA_BOCA + POSTE_Z * H + 5.5   # 1 mm abaixo do ápice da covinha
-    pecas["pino"], comp_pino = pino(H, z_ponta)
-    pecas["base"] = base()
-
-    for nome, m in pecas.items():
-        p = os.path.join(a.saida, f"{nome}.stl")
-        m.export(p)
-        x, y, z = m.extents
-        print(f"{nome}: {x:.1f} x {y:.1f} x {z:.1f} mm  watertight={m.is_watertight}  "
-              f"volume={m.volume/1000:.1f} cm3")
-    print(f"altura da boca acima da base: {ALTURA_BOCA} mm; comprimento do pino: {comp_pino:.0f} mm")
+    gomos, P = montar_gomos(H)
+    conj = trimesh.util.concatenate(gomos)
+    conj.export(os.path.join(a.saida, "balao_16_gomos.stl"))
+    print("balao_16_gomos:", conj.extents.round(1), "mm")
+    s, z_apoio = suporte(P)
+    s.export(os.path.join(a.saida, "suporte.stl"))
+    print("suporte:", s.extents.round(1), "mm  watertight", s.is_watertight, " z do apoio:", round(z_apoio, 1))
 
 
 if __name__ == "__main__":
